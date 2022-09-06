@@ -8,6 +8,7 @@ import platform
 import os
 import sched
 import time
+import sys
 from datetime import datetime
 from decimal import Decimal, getcontext
 
@@ -48,7 +49,7 @@ def rate(key, value):
     return float(rate)
 
 
-def load_properties():
+def load_properties(storage_path_list):
     """Define which properties to publish."""
     properties = {
         "cpu_percent": {
@@ -91,6 +92,14 @@ def load_properties():
         },
     }
 
+    for path in storage_path_list:
+        disk_name = "root" if path == "/" else slugify(path)
+        properties[f"{disk_name}_disk_usage"] = {
+            "unit_of_measurement": "%",
+            "icon": "mdi:harddisk",
+            "call": lambda: psutil.disk_usage(path).percent,
+        }
+
     if hasattr(psutil, "sensors_temperatures"):
         for temp_sensor in psutil.sensors_temperatures():
             properties[temp_sensor] = {
@@ -127,7 +136,7 @@ def gen_ha_config(sensor, properties, base_topic):
     return json.dumps(json_config)
 
 
-def status(mqttc, properties, status_schedurer, period, base_topic):
+def status(mqttc, properties, status_scheduler, period, base_topic):
     """Publish status and schedule the next."""
     for p in properties.keys():
         try:
@@ -136,8 +145,8 @@ def status(mqttc, properties, status_schedurer, period, base_topic):
             )
         except Exception as e:
             logger.error(e)
-    status_schedurer.enter(
-        period, 1, status, (mqttc, properties, status_schedurer, period, base_topic)
+    status_scheduler.enter(
+        period, 1, status, (mqttc, properties, status_scheduler, period, base_topic)
     )
 
     mqttc.publish(
@@ -165,12 +174,12 @@ def publish_ha_discovery(client, properties, config):
         )
 
 
-def on_message(client, userdata, flags):
+def on_message(client, userdata, _flags):
     """MQTT Message callback."""
     publish_ha_discovery(client, *userdata)
 
 
-def on_connect(client, userdata, flags, result):
+def on_connect(client, userdata, _flags, _result):
     """MQTT Connect callback."""
 
     _, config = userdata
@@ -201,6 +210,9 @@ def main():
     parser.add_argument(
         "--ha-status-topic", help="HA status mqtt topic", default=os.environ.get("HA_STATUS_TOPIC", "homeassistant/status")
     )
+    parser.add_argument(
+        '--storage-paths', help="Path(s) for storage usage monitoring (comma separated values)", default=os.environ.get("STORAGE_PATHS", "/")
+    )
     args = parser.parse_args()
 
     config_file = {}
@@ -227,7 +239,18 @@ def main():
             ),
             "ha_status_topic": config_file.get("ha_status_topic", args.ha_status_topic),
             "period": config_file.get("period", args.period),
+            "storage_paths": config_file.get("storage_paths", args.storage_paths)
         }
+
+        # validate storage path provided
+        for path in config["storage_paths"].split(","):
+            if not os.path.isdir(path):
+                logger.error(
+                    "Storage path %s is an invalid configuration option",
+                    path,
+                )
+                sys.exit()
+
 
         for key in list(config):
             if args.__dict__[key] != parser.get_default(
@@ -249,7 +272,7 @@ def main():
                 )
                 logger.info("Saving configuration in %s", args.config)
 
-    properties = load_properties()
+    properties = load_properties(config["storage_paths"].split(","))
 
     logger.debug("Connecting to %s:%s", config["mqtt_server"], config["mqtt_port"])
     mqttc = mqtt.Client(
@@ -271,16 +294,16 @@ def main():
         mqttc.connect(config["mqtt_server"], config["mqtt_port"], 60)
         mqttc.loop_start()
 
-        status_schedurer = sched.scheduler(time.time, time.sleep)
+        status_scheduler = sched.scheduler(time.time, time.sleep)
         status(
             mqttc,
             properties,
-            status_schedurer,
+            status_scheduler,
             config["period"],
             config["mqtt_base_topic"],
         )
 
-        status_schedurer.run()  # block indefinentely
+        status_scheduler.run()  # block indefinitely
 
     except Exception as e:
         logger.error(
